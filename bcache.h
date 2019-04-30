@@ -40,6 +40,92 @@ static const char bcache_magic[] = {
 #define BDEV_DATA_START_DEFAULT	16	/* sectors */
 #define SB_START		(SB_SECTOR * 512)
 
+
+#define ATA_OP_IDENTIFY		0xec
+#define ATA_OP_PIDENTIFY	0xa1
+
+/*
+ * Some useful ATA register bits
+ */
+enum {
+	ATA_USING_LBA		= (1 << 6),
+	ATA_STAT_DRQ		= (1 << 3),
+	ATA_STAT_ERR		= (1 << 0),
+};
+
+/*
+ * ATA PASS-THROUGH (16) CDB
+ */
+#define SG_ATA_16			0x85
+#define SG_ATA_16_LEN			16
+
+/*
+ * ATA Protocols
+ */
+#define SG_ATA_PROTO_PIO_IN		(4 << 1)	/* PIO Data-in */
+
+enum {
+	/* No data is transferred */
+	SG_CDB2_TLEN_NODATA	= 0 << 0,
+	/* Transfer Length is found in the Feature field */
+	SG_CDB2_TLEN_FEAT	= 1 << 0,
+	/* Transfer Length is found in the Sector Count field */
+	SG_CDB2_TLEN_NSECT	= 2 << 0,
+
+	/* transfer units for Transfer Length are bytes */
+	SG_CDB2_TLEN_BYTES	= 0 << 2,
+	/* transfer units for Transfer Length are blocks */
+	SG_CDB2_TLEN_SECTORS	= 1 << 2,
+
+	/* data is transferred from the initiator to the target */
+	SG_CDB2_TDIR_TO_DEV	= 0 << 3,
+	/* indicate that data is transferred from the target to the initiator */
+	SG_CDB2_TDIR_FROM_DEV	= 1 << 3,
+
+	/* Check Condition */
+	SG_CDB2_CHECK_COND	= 1 << 5,
+};
+
+/*
+ *  SCSI Architecture Model (SAM) Status codes. Taken from SAM-6
+ *  T10/BSR INCITS 546 dated January 5, 2018.
+ */
+#define SAM_STAT_GOOD		0x00
+#define SG_CHECK_CONDITION	0x02
+#define SG_DRIVER_SENSE		0x08
+
+/*
+ * This is a slightly modified SCSI sense "descriptor" format header.
+ * The addition is to allow the 0x70 and 0x71 response codes. The idea
+ * is to place the salient data from either "fixed" or "descriptor" sense
+ * format into one structure to ease application processing.
+ *
+ * The original sense buffer should be kept around for those cases
+ * in which more information is required (e.g. the LBA of a MEDIUM ERROR).
+ */
+struct scsi_sense_hdr {		/* See SPC-3 section 4.5 */
+	uint8_t response_code;	/* permit: 0x0, 0x70, 0x71, 0x72, 0x73 */
+	uint8_t sense_key;
+	uint8_t asc;
+	uint8_t ascq;
+	uint8_t byte4;
+	uint8_t byte5;
+	uint8_t byte6;
+	uint8_t additional_length;	/* always 0 for fixed sense format */
+};
+
+/*
+ *  SENSE KEYS
+ */
+
+#define SG_NO_SENSE            0x00
+#define SG_RECOVERED_ERROR     0x01
+
+/* NVME Admin commands */
+#define nvme_admin_identify	0x06
+
+#define NVME_IDENTIFY_DATA_SIZE 4096
+
 struct cache_sb {
 	uint64_t		csum;
 	uint64_t		offset;	/* sector where this sb was written */

@@ -31,9 +31,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
+#include <linux/hdreg.h>
+#include <asm/byteorder.h>
+#include <libgen.h>
 
 #include "bcache.h"
 #include "lib.h"
+
+#include <scsi/sg.h>
+#include <linux/nvme_ioctl.h>
 
 #define max(x, y) ({				\
 	typeof(x) _max1 = (x);			\
@@ -178,6 +184,300 @@ const char * const cache_replacement_policies[] = {
 	"random",
 	NULL
 };
+
+int scsi_normalize_sense(const uint8_t *sense_buffer,
+		struct scsi_sense_hdr *sshdr)
+{
+	if (!sense_buffer)
+		goto err;
+
+	memset(sshdr, 0, sizeof(struct scsi_sense_hdr));
+
+	sshdr->response_code = (sense_buffer[0] & 0x7f);
+	if ((sshdr->response_code & 0x70) != 0x70)
+		goto err;
+
+	if (sshdr->response_code >= 0x72) {
+		/*
+		 * descriptor format
+		 */
+		sshdr->sense_key = (sense_buffer[1] & 0xf);
+		sshdr->asc = sense_buffer[2];
+		sshdr->ascq = sense_buffer[3];
+		sshdr->additional_length = sense_buffer[7];
+	} else {
+		/*
+		 * fixed format
+		 */
+		sshdr->sense_key = (sense_buffer[2] & 0xf);
+		sshdr->asc = sense_buffer[12];
+		sshdr->ascq = sense_buffer[13];
+	}
+
+	return 0;
+err:
+	return -1;
+}
+
+int query_identify(int fd, uint8_t *args)
+{
+#ifdef SG_IO
+	uint8_t cdb[SG_ATA_16_LEN] = { 0 };
+	uint8_t sensebuf[32] = { 0 }, *desc;
+	sg_io_hdr_t io_hdr = { 0 };
+	struct scsi_sense_hdr sshdr = { 0 };
+
+	/*
+	 * ATA PASS-THROUGH (16) CDB
+	 */
+	cdb[0] = SG_ATA_16;		/* OPERATION CODE (85h) */
+	cdb[1] = SG_ATA_PROTO_PIO_IN;	/* PIO Data-in */
+	/* no off.line or cc, read from dev,
+	 * block count in sector count field
+	 */
+	cdb[2] |= SG_CDB2_TLEN_NSECT;
+	cdb[2] |= SG_CDB2_TLEN_SECTORS;
+	cdb[2] |= SG_CDB2_TDIR_FROM_DEV;
+	cdb[13] = ATA_USING_LBA;	/* Device */
+	cdb[14] = args[0];		/* Command */
+
+	io_hdr.interface_id = 'S';
+	io_hdr.mx_sb_len = sizeof(sensebuf);
+	io_hdr.dxfer_direction = SG_DXFER_FROM_DEV;
+	io_hdr.dxfer_len = 512;
+	io_hdr.dxferp = args + 4;
+	io_hdr.cmdp = cdb;
+	io_hdr.cmd_len = SG_ATA_16_LEN;
+	io_hdr.sbp = sensebuf;
+	io_hdr.timeout = 15 * 1000; /* msecs */
+
+	if (ioctl(fd, SG_IO, &io_hdr) == -1)
+		goto use_legacy_ioctl;
+
+	/* sense data available */
+	if (io_hdr.driver_status == SG_DRIVER_SENSE) {
+		desc = sensebuf + 8;
+		/* SG_DRIVER_SENSE is not an error */
+		io_hdr.driver_status &= ~SG_DRIVER_SENSE;
+		/* If we set cc then ATA pass-through will cause a
+		 * check condition even if no error. Filter that. */
+		if (io_hdr.status & SG_CHECK_CONDITION) {
+			scsi_normalize_sense(sensebuf, &sshdr);
+			if (sshdr.sense_key == SG_RECOVERED_ERROR &&
+				sshdr.asc == 0 && sshdr.ascq == 0x1d)
+				io_hdr.status &= ~SG_CHECK_CONDITION;
+		}
+
+		/* return a few ATA registers */
+		if (sensebuf[0] == 0x72 &&	/* format is "descriptor" */
+			desc[0] == 0x09) {	/* ATA Descriptor Return */
+			args[0] = desc[13];	/* Status */
+			args[1] = desc[3];	/* Error */
+			args[2] = desc[5];	/* Sector Count (0:7) */
+		}
+	}
+
+	if (io_hdr.status || io_hdr.host_status || io_hdr.driver_status)
+		goto use_legacy_ioctl;
+
+	return 0;
+
+use_legacy_ioctl:
+#endif
+	return ioctl(fd, HDIO_DRIVE_CMD, args);
+}
+
+int check_trim_supported(int fd,
+			 int *trim,
+			 int *trim_blocks,
+			 int *trim_rzat)
+{
+	*trim = *trim_blocks = *trim_rzat = 0;
+
+	uint8_t args[4 + 512] = { 0 };
+	uint16_t *identify;
+	int i;
+
+	args[0] = ATA_OP_IDENTIFY;
+	if (query_identify(fd, args)) {
+		memset(args, 0, sizeof(args));
+		args[0] = ATA_OP_PIDENTIFY;
+		if (query_identify(fd, args)) {
+			perror("HDIO_DRIVE_CMD(identify) failed");
+			goto err;
+		}
+	}
+
+	/* byte-swap the little-endian IDENTIFY data
+	 * to match byte-order on host CPU
+	 */
+	identify = (uint16_t *)(args + 4);
+	for (i = 0; i < (512 >> 1); ++i)
+		__le16_to_cpus(&identify[i]);
+
+	/* TRIM bit - Identify Device word 169 bit 0
+	 * DRAT bit - Identify Device word 69 bit 14
+	 * RZAT bit - Identify Device word 69 bit 5
+	 * Maximum number of 512-byte blocks per DATA SET MANAGEMENT command
+	 * - Identify Device word 105
+	 *
+	 * If word 169 bit 0 is set to one and word 69 bit 14 is cleared to
+	 * zero, then the Trim function of the DATA SET MANAGEMENT command
+	 * (see 7.10.3.2) supports indeterminate read after trim behavior.
+	 * If word 169 bit 0 is set to one and word 69 bit 14 is set to one,
+	 * the Trim function of the DATA SET MANAGEMENT command supports
+	 * determinate read after trim behavior.
+	 * If word 169 bit 0 is cleared to zero,
+	 * then word 69 bit 14 is reserved.
+	 *
+	 * If word 69 bit 14 is set to one and word 69 bit 5 is set to one,
+	 * then a read operation after a Trim operation returns data from
+	 * trimmed LBAs as all words cleared to zero. If word 69 bit 14
+	 * is set to one and word 69 bit 5 is cleared to zero,
+	 * then a read operation after a Trim operation may have words
+	 * set to any value. If word 69 bit 14 is cleared to zero,
+	 * then word 69 bit 5 is reserved.
+	 *
+	 * See http://t13.org/Documents/UploadedDocuments/docs2009/e0
+	 * 9158r0-Trim_Clarifications.pdf for detail.
+	 */
+	const uint16_t trimd = 1 << 14;	/* deterministic read data after TRIM */
+	const uint16_t trimz = 1 << 5; /* deterministic read ZEROs after TRIM */
+	if (identify[169] & 1 && identify[169] != 0xffff) {/* support TRIM ? */
+		*trim = 1;
+
+		if (identify[69] & trimd) {
+			if (identify[105] && identify[105] != 0xffff)
+				*trim_blocks = (int)identify[105];
+			if (identify[69] & trimz)
+				*trim_rzat = 1;
+		}
+	}
+
+	return 0;
+err:
+	return -1;
+}
+
+int query_nvme_identify(int fd, uint8_t *args)
+{
+#ifdef NVME_IOCTL_ADMIN_CMD
+	struct nvme_passthru_cmd cmd = {
+		.opcode		= nvme_admin_identify,
+		.nsid		= 0,
+		.addr		= (uint64_t)args,
+		.data_len	= NVME_IDENTIFY_DATA_SIZE,
+		.cdw10		= 1,
+		.cdw11		= 0,
+	};
+
+	return ioctl(fd, NVME_IOCTL_ADMIN_CMD, &cmd);
+#endif
+
+	return -1;
+}
+
+int check_nvme_trim_supported(int fd, int *trim)
+{
+	*trim = 0;
+
+	uint8_t args[NVME_IDENTIFY_DATA_SIZE] = { 0 };
+	uint16_t *oncs;
+
+	if (!query_nvme_identify(fd, args)) {
+		// offsetof(oncs, struct nvme_id_ctrl)
+		oncs = (uint16_t *)(args + 0x208);
+		__le16_to_cpus(&oncs[0]);
+		*trim = (oncs[0] & 0x4) >> 2;
+
+		return 0;
+	}
+
+	return -1;
+}
+
+int blkdiscard(int fd)
+{
+	uint64_t end, blksize, secsize, range[2];
+	struct stat sb;
+
+	range[0] = 0;
+	range[1] = ULLONG_MAX;
+
+	if (fstat(fd, &sb) == -1) {
+		perror("stat failed");
+		goto err;
+	}
+
+	if (!S_ISBLK(sb.st_mode)) {
+		fprintf(stderr, "is not a block device\n");
+		goto err;
+	}
+
+	if (ioctl(fd, BLKGETSIZE64, &blksize)) {
+		perror("BLKGETSIZE64 ioctl failed");
+		goto err;
+	}
+	if (ioctl(fd, BLKSSZGET, &secsize)) {
+		perror("BLKSSZGET ioctl failed");
+		goto err;
+	}
+
+	/* align range to the sector size */
+	range[0] = (range[0] + secsize - 1) & ~(secsize - 1);
+	range[1] &= ~(secsize - 1);
+
+	/* is the range end behind the end of the device ?*/
+	end = range[0] + range[1];
+	if (end < range[0] || end > blksize)
+		range[1] = blksize - range[0];
+
+	if (ioctl(fd, BLKDISCARD, &range)) {
+		perror("BLKDISCARD ioctl failed");
+		goto err;
+	}
+
+	return 0;
+err:
+	return -1;
+}
+
+void trim_all_sectors(char *path, int fd)
+{
+	char *dev = basename(path);
+	int trim_supported = 0;
+	int trim_blocks = 0;
+	int trim_rzat = 0;
+	if (!strncmp(dev, "nvme", 4))
+		check_nvme_trim_supported(fd, &trim_supported);
+	else
+		if (check_trim_supported(fd,
+					 &trim_supported,
+					 &trim_blocks,
+					 &trim_rzat))
+			check_nvme_trim_supported(fd, &trim_supported);
+
+	if (trim_supported) {
+		printf("TRIM:\t\t\tData Set Management TRIM supported");
+		if (trim_blocks)
+			printf(" (limit %d block%s)",
+				trim_blocks, trim_blocks > 1 ? "s" : "");
+		printf("\n");
+
+		if (trim_rzat) {
+			printf("RZAT:");
+			printf("\t\t\tDeterministic read ZEROs after TRIM\n");
+		}
+
+		printf("%s blkdiscard beginning...\n", path);
+		if (blkdiscard(fd))
+			fprintf(stderr, "%s blkdiscard failed: %s",
+					path, strerror(errno));
+		else
+			printf("%s blkdiscard successfully\n", path);
+	} else
+		printf("%s Skiping blkdiscard\n", path);
+}
 
 static void write_sb(char *dev, unsigned int block_size,
 			unsigned int bucket_size,
@@ -354,6 +654,11 @@ static void write_sb(char *dev, unsigned int block_size,
 		       sb.nr_in_set,
 		       sb.nr_this_dev,
 		       sb.first_bucket);
+
+		/* check whether cache dev supports TRIM or not.
+		 * if supports, trim all sectors
+		 */
+		trim_all_sectors(dev, fd);
 		putchar('\n');
 	}
 
@@ -429,7 +734,7 @@ int make_bcache(int argc, char **argv)
 	unsigned int i, ncache_devices = 0, nbacking_devices = 0;
 	char *cache_devices[argc];
 	char *backing_devices[argc];
-	char label[SB_LABEL_SIZE];
+	char label[SB_LABEL_SIZE] = { 0 };
 	unsigned int block_size = 0, bucket_size = 1024;
 	int writeback = 0, discard = 0, wipe_bcache = 0, force = 0;
 	unsigned int cache_replacement_policy = 0;
