@@ -142,7 +142,7 @@ int setlabel_usage(void)
 	return EXIT_FAILURE;
 }
 
-int version_usagee(void)
+int version_usage(void)
 {
 	fprintf(stderr,
 		"Usage: version		display software version\n");
@@ -157,7 +157,7 @@ void replace_line(char **dest, const char *from, const char *to)
 
 	strcpy(sub, *dest);
 	while (1) {
-		char *tmp = strpbrk(sub, from);
+		char *tmp = strstr(sub, from);
 
 		if (tmp != NULL) {
 			strcpy(new, tmp);
@@ -166,7 +166,7 @@ void replace_line(char **dest, const char *from, const char *to)
 			break;
 	}
 	if (strlen(new) > 0) {
-		strncpy(new, to, strlen(to));
+		snprintf(new, sizeof(new), "%s", to);
 		sprintf(*dest + strlen(*dest) - strlen(new), new, strlen(new));
 	}
 }
@@ -453,7 +453,7 @@ int main(int argc, char **argv)
 		return set_label(devname, argv[2]);
 	} else if (strcmp(subcmd, "version") == 0) {
 		if (argc != 1)
-			return version_usagee();
+			return version_usage();
 		printf("bcache-tools %s\n", BCACHE_TOOLS_VERSION);
 
 		return 0;
